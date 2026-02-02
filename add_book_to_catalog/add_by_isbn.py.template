@@ -1,0 +1,312 @@
+import requests
+import sys
+import json
+import re
+from bs4 import BeautifulSoup
+import cv2
+import numpy as np
+from pyzbar import pyzbar
+
+class BookInfo:
+    def __init__(self, isbn, title, authors, keywords, description, location):
+        self.isbn = isbn
+        self.title = title
+        self.authors = authors
+        self.keywords = keywords
+        self.description = description
+        self.location = location
+
+    def __repr__(self):
+        return (f"BookInfo(ISBN={self.isbn}, Title={self.title}, Authors={self.authors}, "
+                f"Keywords={self.keywords}, Description={self.description}, Location={self.location})")
+
+    def pretty_print(self):
+        print("Book Information:")
+        print(f"Title: {self.title}")
+        print(f"Authors: {', '.join(self.authors)}")
+        print(f"ISBN: {self.isbn}")
+        print(f"Location: {self.location}")
+        print(f"Keywords: {', '.join(self.keywords)}")
+        print(f"Synopsis: {self.description}")
+        print()
+
+    def to_json_payload(self):
+        """Convert book info to JSON payload expected by new API"""
+        return {
+            'title': self.title,
+            'author': ', '.join(self.authors),
+            'isbn': self.isbn,
+            'location': self.location,
+            'keywords': ', '.join(self.keywords),
+            'synopsis': self.description
+        }
+
+BASE_URL = "http://YOUR_ESP32_IP_ADDRESS"  # Update this to your ESP32's IP address
+
+def login(session):
+    login_url = f"{BASE_URL}/authenticate"
+    login_data = {
+        'username': 'admin',  # Username for admin account
+        'password': 'ADMIN_PASSWORD_HERE'   # Admin password
+    }
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    response = session.post(login_url, json=login_data, headers=headers)
+
+    if response.status_code == 200:
+        # Extract token from response
+        response_data = response.json()
+        if response_data.get('status') == 'ok' and 'token' in response_data:
+            token = response_data['token']
+            # Add token to session cookies as 'session' for future requests
+            session.cookies.set('session', token)
+            print("Logged in successfully!")
+        else:
+            print("Login failed. Invalid response from server.")
+            sys.exit(1)
+    else:
+        print("Login failed. Please check your credentials.")
+        sys.exit(1)
+
+def get_google_description(isbn):
+    print("Attempt to get synopsis from google.")
+    url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}"
+    response = requests.get(url)
+    data = response.json()
+
+    if 'items' in data and len(data['items']) > 0:
+        google_book_info = data['items'][0]['volumeInfo']
+        return google_book_info.get('description', None)
+
+    return None
+
+def scrape_thriftbooks_synopsis(isbn):
+    print("Attempt to get synopsis from thriftbooks");
+    url = "https://www.thriftbooks.com/browse/?b.search=" + isbn
+
+    try:
+        response = requests.get(url)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            # Parse the HTML content
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Locate the overview section in the page
+            overview_section = soup.find('p', class_='WorkMeta-overview')
+            if overview_section:
+                # Extract the synopsis text
+                synopsis = overview_section.get_text(strip=True)
+                return synopsis
+            else:
+                 print("Synopsis not found on ThriftBooks.")
+                 return None
+        else:
+           print(f"Failed to retrieve page, status code: {response.status_code}")
+           return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+def scan_barcode_from_camera():
+    """
+    Scans ISBN barcodes from a USB webcam.
+    Returns the scanned ISBN as a string, or None if no barcode is detected.
+    """
+    print("Starting camera to scan ISBN barcode...")
+    print("Press 'q' to quit the camera window.")
+
+    # Initialize the camera
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return None
+
+    while True:
+        # Capture frame-by-frame
+        ret, frame = cap.read()
+
+        if not ret:
+            print("Error: Failed to capture frame.")
+            break
+
+        # Decode barcodes in the frame
+        decoded_objects = pyzbar.decode(frame)
+
+        # Loop through all decoded objects
+        for obj in decoded_objects:
+            # Extract barcode data
+            barcode_data = obj.data.decode("utf-8")
+            barcode_type = obj.type
+
+            # Check if the barcode is a valid ISBN (usually EAN-13 format)
+            if barcode_type == "EAN13" and len(barcode_data) == 13:
+                # Draw bounding box around the barcode
+                (x, y, w, h) = obj.rect
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                # Display the barcode data and type on the frame
+                cv2.putText(frame, f"{barcode_data}",
+                           (obj.rect.left, obj.rect.top - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                print(f"Detected ISBN: {barcode_data}")
+
+                # Release the camera and return the ISBN
+                cap.release()
+                cv2.destroyAllWindows()
+                return barcode_data
+
+        # Display the resulting frame
+        cv2.imshow("Barcode Scanner", frame)
+
+        # Press 'q' to quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Release the camera and close windows
+    cap.release()
+    cv2.destroyAllWindows()
+    return None
+
+def get_book_info(session, isbn, location):
+    url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+    response = session.get(url)
+    data = response.json()
+
+    key = f"ISBN:{isbn}"
+    if key not in data:
+        print("Book not found.")
+        return None
+
+    book_info = data[key]
+    title = book_info.get('title', 'Unknown Title')
+    authors = [author['name'] for author in book_info.get('authors', [{'name': 'Unknown Author'}])]
+    description = book_info.get('description')
+    if not description:
+        description = get_google_description(isbn)
+        if not description:
+            description = scrape_thriftbooks_synopsis(isbn)
+        if not description:
+            description = "Synopsis not available."
+    categories = book_info.get('subjects', [])
+
+    # Create keywords from title, authors, and categories
+    keywords = [title] + authors + [subject['name'] for subject in categories]
+
+    # Create a BookInfo object
+    return BookInfo(isbn, title, authors, keywords, description, location)
+
+def add_to_library(session, book_info):
+    # Updated URL for the new ESP32 route handler
+    url = f"{BASE_URL}/add"  # Using the same base URL
+
+    # Prepare JSON payload
+    json_data = book_info.to_json_payload()
+
+    # Send POST request with JSON payload
+    # Session cookie is already set from login
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    response = session.post(url, json=json_data, headers=headers)
+
+    if response.status_code == 201:
+        print("Book added to library successfully!")
+    elif response.status_code == 401:
+        print("Authentication failed. You may need to authenticate as admin first.")
+    else:
+        print(f"Failed to add book to library. Status code: {response.status_code}, Response: {response.text}")
+
+def main(isbn, location):
+    session = requests.Session()
+    login(session)
+
+    book_info = get_book_info(session, isbn, location)
+
+    if book_info:
+        book_info.pretty_print()
+
+        confirm = input("Do you want to add this book to your library? (yes/no): ").strip().lower()
+        if confirm in ['yes', 'y']:
+            add_to_library(session, book_info)
+        else:
+            print("Book not added to library.")
+
+def main_loop():
+    """
+    Main loop that allows continuously adding books without re-authenticating
+    """
+    session = requests.Session()
+    login(session)  # Login once at the beginning
+
+    while True:
+        print("\n--- Book Addition Menu ---")
+        print("1. Scan ISBN from camera")
+        print("2. Enter ISBN manually")
+        print("3. Exit")
+
+        choice = input("Enter choice (1, 2, or 3): ").strip()
+
+        if choice == "1":
+            print("Scanning for ISBN barcode...")
+            isbn = scan_barcode_from_camera()
+            if not isbn:
+                print("No barcode detected. Returning to menu.")
+                continue
+            print(f"Scanned ISBN: {isbn}")
+        elif choice == "2":
+            isbn = input("Enter ISBN manually: ").strip()
+        elif choice == "3":
+            print("Exiting program.")
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+            continue
+
+        # Ask for location
+        location = input("Enter location for the book: ").strip()
+
+        # Get book info
+        book_info = get_book_info(session, isbn, location)
+
+        if book_info:
+            book_info.pretty_print()
+
+            confirm = input("Do you want to add this book to your library? (yes/no): ").strip().lower()
+            if confirm in ['yes', 'y']:
+                add_to_library(session, book_info)
+            else:
+                print("Book not added to library.")
+        else:
+            print("Could not retrieve book information.")
+
+        # Ask if user wants to continue
+        continue_choice = input("\nDo you want to add another book? (yes/no): ").strip().lower()
+        if continue_choice not in ['yes', 'y']:
+            print("Exiting program.")
+            break
+
+# Main entry point
+if __name__ == "__main__":
+    if len(sys.argv) >= 2:
+        # Use command-line arguments if provided (backward compatibility)
+        isbn = sys.argv[1]
+        location = sys.argv[2] if len(sys.argv) > 2 else input("Enter location for the book: ")
+        session = requests.Session()
+        login(session)
+
+        # Call the original main function with session
+        book_info = get_book_info(session, isbn, location)
+        if book_info:
+            book_info.pretty_print()
+            confirm = input("Do you want to add this book to your library? (yes/no): ").strip().lower()
+            if confirm in ['yes', 'y']:
+                add_to_library(session, book_info)
+            else:
+                print("Book not added to library.")
+    else:
+        # Use interactive menu if no command-line arguments
+        main_loop()
